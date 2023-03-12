@@ -1,18 +1,24 @@
 use clap::Parser;
 use lopdf;
-use reqwest;
+use reqwest::{self, Request};
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use unidecode::unidecode;
 use std::collections::HashMap;
-use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::{fs, io};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use unidecode::unidecode;
 use url;
+
+#[derive(Deserialize)]
+struct IsDownloadableResponse {
+    isDownloadable: bool,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Bookmark {
@@ -34,6 +40,8 @@ struct Book {
     id: u64,
     #[serde(default)]
     page_shift: i64,
+    #[serde(default)]
+    native_downloadable: bool,
     #[serde(default)]
     #[serde(rename = "nothing")]
     title: String,
@@ -106,6 +114,112 @@ async fn save_page_to_file(
     }
 }
 
+async fn fill_teaching_tool_metadata(
+    client: &reqwest::Client,
+    teaching_tool: &mut TeachingTool,
+) -> Result<(), EdukaError> {
+    let is_downloadable_response: IsDownloadableResponse = client
+        .get(&format!(
+            "https://klase.eduka.lt/api/authenticated/teaching-tool/is-downloadable/{}",
+            &teaching_tool.id
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let mut book: Book = client
+        .get(
+            &(String::from("https://klase.eduka.lt/api/authenticated/part/show-by-teaching-tool/")
+                + &teaching_tool.id.to_string()),
+        )
+        .send()
+        .await?
+        .json()
+        .await?;
+    book.title = book.collection_title.clone()
+        + ": "
+        + &book
+            .parts
+            .get(0)
+            .ok_or(EdukaError::UnexpectedResponse)?
+            .title;
+    book.id = teaching_tool.id;
+    book.native_downloadable = is_downloadable_response.isDownloadable;
+    teaching_tool.book = book.clone();
+    let pages_json: serde_json::Value = serde_json::from_str(
+        &client
+            .get(
+                &(String::from("https://klase.eduka.lt/api/authenticated/teaching-tool/pages/")
+                    + &book.id.to_string()),
+            )
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pages_objects_array = pages_json.get("pages").unwrap().as_array().unwrap();
+    for page in pages_objects_array {
+        let img_url_frag = page["img"]["1140"].as_str();
+        if let Some(img_url_frag) = img_url_frag {
+            book.page_urls
+                .push(String::from("https://klase.eduka.lt") + img_url_frag);
+        } else {
+            println!("Couldn't get page by {:?}", &page)
+        }
+    }
+    book.page_shift = pages_json.get("pageShift").unwrap().as_i64().unwrap();
+    let bookmarks_array: Vec<Bookmark> = serde_json::from_str(
+        &pages_json
+            .get("chapters")
+            .ok_or(EdukaError::UnexpectedResponse)?
+            .to_string(),
+    )
+    .map_err(|_| EdukaError::UnexpectedResponse)?;
+    book.bookmarks = bookmarks_array;
+    teaching_tool.book = book.clone();
+    Ok(())
+}
+
+async fn download_teaching_tool(
+    client: &Arc<reqwest::Client>,
+    teaching_tool: &TeachingTool,
+) -> Result<(), EdukaError> {
+    let book = &teaching_tool.book;
+    let book_dir = String::from("./") + &book.title + " ;;; " + &book.id.to_string();
+    // skip already started to dl books
+    if Path::new(&book_dir).is_dir() {
+        println!("SKIPPING");
+        return Ok(());
+    }
+    fs::create_dir_all(&book_dir).unwrap();
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for (i, page) in book.page_urls.iter().enumerate() {
+        let cl_clone = client.clone();
+        let book_dir = book_dir.clone();
+        let p_clone = page.clone();
+
+        handles.push(tokio::spawn(async move {
+            save_page_to_file(cl_clone, &book_dir, &p_clone, i.try_into().unwrap()).await;
+        }));
+        if i % 10 == 0 {
+            for handle in &mut handles {
+                handle.await.unwrap();
+            }
+            handles.clear();
+        }
+    }
+    for handle in &mut handles {
+        handle.await.unwrap();
+    }
+    handles.clear();
+    println!("SUCCESSFULLY DOWNLOADED BOOK {}", &book.title);
+    Ok(())
+}
+
 async fn download_package(client: Arc<reqwest::Client>, id: u64) -> Result<Package, EdukaError> {
     let url = reqwest::Url::parse_with_params(
         &(String::from("https://klase.eduka.lt/api/authenticated/teaching-package/")
@@ -114,157 +228,88 @@ async fn download_package(client: Arc<reqwest::Client>, id: u64) -> Result<Packa
     )
     .unwrap();
     let mut package: Package = client.get(url).send().await?.json().await?;
-    let mut books: Vec<Book> = Vec::new();
     for teaching_tool in &mut package.teaching_tools {
-        let mut book: Book = client
-            .get(
-                &(String::from(
-                    "https://klase.eduka.lt/api/authenticated/part/show-by-teaching-tool/",
-                ) + &teaching_tool.id.to_string()),
-            )
-            .send()
-            .await?
-            .json()
-            .await?;
-        book.title = book.collection_title.clone() + ": " + &book.parts.get(0).unwrap().title;
-        book.id = teaching_tool.id;
-        teaching_tool.book = book.clone();
-        let pages_json: serde_json::Value = serde_json::from_str(
-            &client
-                .get(
-                    &(String::from(
-                        "https://klase.eduka.lt/api/authenticated/teaching-tool/pages/",
-                    ) + &book.id.to_string()),
-                )
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let pages_objects_array = pages_json.get("pages").unwrap().as_array().unwrap();
-        for page in pages_objects_array {
-            let img_url_frag = page["img"]["1140"].as_str();
-            if let Some(img_url_frag) = img_url_frag {
-                book.page_urls
-                    .push(String::from("https://klase.eduka.lt") + img_url_frag);
-            } else {
-                println!("Couldn't get page by {:?}", &page)
-            }
-        }
-        book.page_shift = pages_json.get("pageShift").unwrap().as_i64().unwrap();
-        let bookmarks_array: Vec<Bookmark> =
-            serde_json::from_str(&pages_json.get("chapters").unwrap().to_string()).unwrap();
-        book.bookmarks = bookmarks_array;
-        teaching_tool.book = book.clone();
-        books.push(book);
+        fill_teaching_tool_metadata(&client, teaching_tool).await?;
     }
-    for book in books {
-        let book_dir = String::from("./") + &book.title + " ;;; " + &book.id.to_string();
-        // skip already started to dl books
-        if Path::new(&book_dir).is_dir() {
-            println!("SKIPPING");
-            continue;
-        }
-        fs::create_dir_all(&book_dir).unwrap();
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(String::from(&book_dir) + "/info.json")
-            .unwrap();
-        serde_json::to_writer_pretty(f, &package).unwrap();
-
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for (i, page) in book.page_urls.iter().enumerate() {
-            let cl_clone = client.clone();
-            let book_dir = book_dir.clone();
-            let p_clone = page.clone();
-
-            handles.push(tokio::spawn(async move {
-                save_page_to_file(cl_clone, &book_dir, &p_clone, i.try_into().unwrap()).await;
-            }));
-            if i % 10 == 0 {
-                for handle in &mut handles {
-                    handle.await.unwrap();
-                }
-                handles.clear();
-            }
-        }
-        for handle in &mut handles {
-            handle.await.unwrap();
-        }
-        handles.clear();
-        println!("SUCCESSFULLY DOWNLOADED BOOK {}", &book.title);
+    for teaching_tool in &package.teaching_tools {
+        download_teaching_tool(&client, teaching_tool).await?;
     }
     Ok(package)
 }
 
+fn prepare_teaching_tool(teaching_tool: &TeachingTool) -> Result<(), EdukaError> {
+    let book_dir = String::from("./")
+        + &teaching_tool.book.title
+        + " ;;; "
+        + &teaching_tool.book.id.to_string();
+
+    assert!(Command::new("bash")
+        .arg("-c")
+        .arg(
+            String::from("img2pdf $(ls *.png | sort -n) | ocrmypdf -l lit - ")
+                + &teaching_tool.book.id.to_string()
+                + ".pdf"
+        )
+        .current_dir(fs::canonicalize(&book_dir).unwrap())
+        .status()
+        .expect("failed to execute process")
+        .success());
+
+    let pdf_path = std::path::Path::new(&book_dir).join(format!("{}.pdf", &teaching_tool.book.id));
+
+    let mut doc = lopdf::Document::load(&pdf_path)?;
+
+    fn add_bookmarks(
+        doc: &mut lopdf::Document,
+        page_shift: i64,
+        bookmarks: &Vec<Bookmark>,
+        parent_id: Option<u32>,
+    ) -> Result<(), EdukaError> {
+        for eduka_bookmark in bookmarks {
+            let page_num = ({
+                if eduka_bookmark.startPage == 0 {
+                    if let Some(child) = eduka_bookmark.lessons.get(0) {
+                        child.startPage
+                    } else {
+                        0
+                    }
+                } else {
+                    eduka_bookmark.startPage
+                }
+            } as i64
+                - page_shift) as u32;
+            let page_id = doc
+                .get_pages()
+                .get(&page_num)
+                .ok_or(EdukaError::PositionOffsetError)?
+                .to_owned();
+
+            // breaks in table of contents, surely its possible? LOPDF BUG?
+            let ascii_title = unidecode(&eduka_bookmark.title);
+            let lo_bookmark = lopdf::Bookmark::new(ascii_title, [1.0; 3], 0, page_id);
+            let bookmark_id = doc.add_bookmark(lo_bookmark, parent_id);
+            add_bookmarks(doc, page_shift, &eduka_bookmark.lessons, Some(bookmark_id))?;
+        }
+        Ok(())
+    }
+    add_bookmarks(
+        &mut doc,
+        teaching_tool.book.page_shift,
+        &teaching_tool.book.bookmarks,
+        None,
+    )?;
+    if let Some(n) = doc.build_outline() {
+        doc.catalog_mut()?
+            .set("Outlines", lopdf::Object::Reference(n));
+    }
+    doc.save(&pdf_path)?;
+    Ok(())
+}
+
 fn prepare_package(package: Package) -> Result<(), EdukaError> {
     for teaching_tool in &package.teaching_tools {
-        let book_dir = String::from("./")
-            + &teaching_tool.book.title
-            + " ;;; "
-            + &teaching_tool.book.id.to_string();
-
-        assert!(Command::new("bash")
-            .arg("-c")
-            .arg(
-                String::from("img2pdf $(ls *.png | sort -n) | ocrmypdf -l lit - ")
-                    + &teaching_tool.book.id.to_string()
-                    + ".pdf"
-            )
-            .current_dir(fs::canonicalize(&book_dir).unwrap())
-            .status()
-            .expect("failed to execute process")
-            .success());
-
-        let pdf_path =
-            std::path::Path::new(&book_dir).join(format!("{}.pdf", &teaching_tool.book.id));
-
-        let mut doc = lopdf::Document::load(&pdf_path)?;
-
-        fn add_bookmarks(
-            doc: &mut lopdf::Document,
-            page_shift: i64,
-            bookmarks: &Vec<Bookmark>,
-            parent_id: Option<u32>,
-        ) -> Result<(), EdukaError> {
-            for eduka_bookmark in bookmarks {
-                let page_num = ({
-                    if eduka_bookmark.startPage == 0 {
-                        if let Some(child) = eduka_bookmark.lessons.get(0) {
-                            child.startPage
-                        } else {
-                            0
-                        }
-                    } else {
-                        eduka_bookmark.startPage
-                    }
-                } as i64 - page_shift) as u32;
-                let page_id = doc
-                    .get_pages()
-                    .get(&page_num)
-                    .ok_or(EdukaError::PositionOffsetError)?
-                    .to_owned();
-
-                // breaks in table of contents, surely its possible? LOPDF BUG?
-                let ascii_title = unidecode(&eduka_bookmark.title);
-                let lo_bookmark = lopdf::Bookmark::new(ascii_title, [1.0; 3], 0, page_id);
-                let bookmark_id = doc.add_bookmark(lo_bookmark, parent_id);
-                add_bookmarks(doc, page_shift, &eduka_bookmark.lessons, Some(bookmark_id))?;
-            }
-            Ok(())
-        }
-        add_bookmarks(&mut doc, teaching_tool.book.page_shift, &teaching_tool.book.bookmarks, None)?;
-        if let Some(n) = doc.build_outline() {
-            doc.catalog_mut()?
-                .set("Outlines", lopdf::Object::Reference(n));
-        }
-        doc.save(&pdf_path)?;
+        prepare_teaching_tool(teaching_tool)?;
     }
-
     Ok(())
 }
 
@@ -275,6 +320,8 @@ struct Cli {
     #[arg(short, long)]
     password: String,
     books: Vec<String>,
+    #[arg(long)]
+    exploration_start: Option<u64>,
 }
 
 #[tokio::main]
@@ -298,13 +345,61 @@ async fn main() {
         match login_response.status() {
             reqwest::StatusCode::OK => {
                 if cli.books.is_empty() {
-                    let mut i = 1;
+                    let mut teaching_tools_to_download = vec![];
+                    let mut i = match cli.exploration_start {
+                        Some(exploration_start) => exploration_start,
+                        None => 0,
+                    };
                     loop {
-                        let package = download_package(client.clone(), i).await;
-                        if let Ok(package) = package {
-                            prepare_package(package).unwrap();
+                        let mut teaching_tool = TeachingTool {
+                            id: i,
+                            book: Default::default(),
+                        };
+                        println!("trying teaching tool {}", &i);
+                        if let Ok(()) =
+                            fill_teaching_tool_metadata(&client, &mut teaching_tool).await
+                        {
+                            let mut input_string = String::new();
+                            while !(input_string.trim() == "y"
+                                || input_string.trim() == "n"
+                                || input_string.trim() == "cancel")
+                            {
+                                if teaching_tool.book.native_downloadable {
+                                    print!("[NATIVE DOWNLOADABLE]");
+                                }
+                                print!(
+                                    "Should {} be downloaded (y/n/cancel): ",
+                                    &teaching_tool.book.title
+                                );
+                                io::stdout().flush();
+                                input_string.clear();
+                                io::stdin()
+                                    .read_line(&mut input_string)
+                                    .expect("reading user input failed");
+                            }
+                            match input_string.trim().as_ref() {
+                                "y" => {
+                                    teaching_tools_to_download.push(teaching_tool);
+                                }
+                                "cancel" => {
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
                         i += 1;
+                    }
+                    for teaching_tool in teaching_tools_to_download {
+                        if let Ok(()) = download_teaching_tool(&client, &teaching_tool).await {
+                            println!("downloaded {}", &teaching_tool.book.title);
+                            if let Ok(()) = prepare_teaching_tool(&teaching_tool) {
+                                println!("prepared {}", teaching_tool.book.title);
+                            } else {
+                                println!("failed to prepare {}", teaching_tool.book.title);
+                            }
+                        } else {
+                            println!("failed to download {}", &teaching_tool.book.title);
+                        }
                     }
                 } else {
                     for book in cli.books {
